@@ -13,6 +13,10 @@ app.get('/health', (_req, res) => res.status(200).json({ ok: true, ts: Date.now(
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`[WEB] Listening on :${port}`));
 
+process.env.DISCORDJS_VOICE_TRANSPORT =
+  process.env.DISCORDJS_VOICE_TRANSPORT || 'udp';
+
+
 const { Client, GatewayIntentBits, Events } = require('discord.js');
 const {
   joinVoiceChannel,
