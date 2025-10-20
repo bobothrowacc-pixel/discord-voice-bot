@@ -10,10 +10,13 @@
   "engines": {
     "node": "20.x"
   },
-  "dependencies": {
-    "@discordjs/voice": "^0.19.0",
-    "discord.js": "^14.23.2",
-    "dotenv": "^17.2.3",
-    "express": "^4.19.2"
-  }
+"dependencies": {
+  "@discordjs/voice": "^0.19.0",
+  "@snazzah/davey": "0.1.6",
+  "discord.js": "^14.23.2",
+  "dotenv": "^17.2.3",
+  "express": "^4.19.2",
+  "wrtc": "^0.4.7"
+}
+
 }
