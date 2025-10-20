@@ -8,9 +8,6 @@ const express = require('express');
 const app = express();
 
 
-process.env.DISCORDJS_VOICE_TRANSPORT = 'udp';
-
-
 app.get('/', (_req, res) => res.status(200).send('OK'));    // health endpoint for UptimeRobot
 app.get('/health', (_req, res) => res.status(200).json({ ok: true, ts: Date.now() }));
 
