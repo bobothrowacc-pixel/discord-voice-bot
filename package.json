@@ -1,17 +1,14 @@
 {
   "name": "discord-voice-bot",
   "version": "1.0.0",
-  "description": "Discord bot that stays in a VC 24/7 using Opus silence",
   "main": "bot.js",
   "type": "commonjs",
   "scripts": {
     "start": "node bot.js"
   },
-  "engines": {
-    "node": "20.x"
-  },
   "dependencies": {
     "@discordjs/voice": "^0.19.0",
+    "@snazzah/davey": "^0.1.6",
     "discord.js": "^14.23.2",
     "dotenv": "^17.2.3",
     "express": "^4.19.2"
