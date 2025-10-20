@@ -3,6 +3,14 @@
 process.env.DISCORDJS_VOICE_TRANSPORT = 'udp';
 console.log('Transport env:', process.env.DISCORDJS_VOICE_TRANSPORT);
 
+process.on('unhandledRejection', (err) => {
+  console.error('UnhandledRejection:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('UncaughtException:', err);
+});
+
+
 require('dotenv').config();
 const express = require('express');
 const app = express();
