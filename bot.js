@@ -1,6 +1,4 @@
 // --- FORCE UDP (disable DAVE/WebRTC) BEFORE importing @discordjs/voice ---
-process.env.DISCORDJS_VOICE_TRANSPORT =
-  process.env.DISCORDJS_VOICE_TRANSPORT || 'udp';
 console.log('Transport env:', process.env.DISCORDJS_VOICE_TRANSPORT);
 
 // Load env vars for your token/IDs
