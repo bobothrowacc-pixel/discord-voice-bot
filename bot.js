@@ -14,9 +14,7 @@ const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`[WEB] Listening on :${port}`));
 
 // --- Discord / Voice ---
-const {
-  Client, GatewayIntentBits, Events, REST, Routes, AttachmentBuilder
-} = require('discord.js');
+const { Client, GatewayIntentBits, Events } = require('discord.js');
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -33,7 +31,7 @@ console.log('[Voice Deps]\n' + generateDependencyReport());
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID; // VC to pin bot in
-const DB_PATH = process.env.DB_PATH || './data.db';     // use persistent disk in prod
+const DB_PATH = process.env.DB_PATH || './data.db';     // use persistent disk/remote DB in prod
 
 // ---------- DB (SQLite via better-sqlite3) ----------
 const Database = require('better-sqlite3');
@@ -60,7 +58,6 @@ const startSessionStmt = db.prepare(`
   ON CONFLICT(user_id) DO UPDATE SET started_at = excluded.started_at
 `);
 const endSessionStmt = db.prepare(`DELETE FROM sessions WHERE user_id = ?`);
-const getTopStmt = db.prepare(`SELECT user_id, total_ms FROM user_hours ORDER BY total_ms DESC LIMIT ?`);
 const getSessionStmt = db.prepare(`SELECT started_at FROM sessions WHERE user_id = ?`);
 
 function startSession(userId, when = Date.now()) {
@@ -218,137 +215,6 @@ async function seedCurrentSessions() {
   console.log('[TIME] Seeded sessions for current VC members.');
 }
 
-// ---------- Slash commands ----------
-const commands = [
-  {
-    name: 'leaderboard',
-    description: 'Show top users by total voice time.',
-    options: [
-      {
-        name: 'limit',
-        description: 'How many to show (default 10, max 20)',
-        type: 4, // INTEGER
-        required: false
-      }
-    ]
-  }
-];
-
-async function registerCommands() {
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
-  const app = await client.application.fetch();
-  await rest.put(Routes.applicationGuildCommands(app.id, GUILD_ID), { body: commands });
-  console.log('✅ Registered slash commands.');
-}
-
-// ---------- Canvas rendering ----------
-const { createCanvas, loadImage } = require('@napi-rs/canvas');
-
-function formatHMS(ms) {
-  const totalSec = Math.floor(ms / 1000);
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const s = totalSec % 60;
-  return `${h}h ${m}m ${s}s`;
-}
-
-async function renderLeaderboard(guild, limit = 10) {
-  const rows = getTopStmt.all(Math.min(20, Math.max(1, limit)));
-  const width = 950;
-  const rowH = 96;
-  const headerH = 110;
-  const height = headerH + rowH * rows.length + 40;
-
-  const canvas = createCanvas(width, height);
-  const ctx = canvas.getContext('2d');
-
-  // background
-  ctx.fillStyle = '#0f172a';
-  ctx.fillRect(0, 0, width, height);
-
-  // header
-  ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 40px sans-serif';
-  ctx.fillText('🎧 Voice Time Leaderboard', 32, 60);
-  ctx.font = '16px sans-serif';
-  ctx.fillStyle = '#cbd5e1';
-  ctx.fillText(`Updated: ${new Date().toLocaleString()}`, 32, 88);
-
-  // rows
-  let y = headerH;
-  for (let i = 0; i < rows.length; i++) {
-    const { user_id, total_ms } = rows[i];
-
-    // row background
-    ctx.fillStyle = i % 2 === 0 ? '#111827' : '#0b1220';
-    ctx.fillRect(20, y - 10, width - 40, rowH - 8);
-
-    // rank
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = 'bold 22px sans-serif';
-    ctx.fillText(String(i + 1).padStart(2, '0'), 32, y + 18);
-
-    // avatar
-    let avatarUrl = null;
-    try {
-      const member = await guild.members.fetch(user_id);
-      avatarUrl = member.user.displayAvatarURL({ extension: 'png', size: 128 });
-    } catch { /* user might have left */ }
-
-    if (avatarUrl) {
-      try {
-        const img = await loadImage(avatarUrl);
-        const ax = 70, ay = y - 6, size = 64;
-        ctx.save();
-        ctx.beginPath();
-        ctx.arc(ax + size / 2, ay + size / 2, size / 2, 0, Math.PI * 2);
-        ctx.closePath();
-        ctx.clip();
-        ctx.drawImage(img, ax, ay, size, size);
-        ctx.restore();
-      } catch {}
-    }
-
-    // username & hours
-    let displayName = user_id;
-    try {
-      const member = await guild.members.fetch(user_id);
-      displayName = member.displayName || member.user.username;
-    } catch {}
-
-    ctx.fillStyle = '#e5e7eb';
-    ctx.font = 'bold 22px sans-serif';
-    ctx.fillText(displayName, 150, y + 16);
-
-    ctx.fillStyle = '#a7f3d0';
-    ctx.font = 'bold 20px monospace';
-    ctx.fillText(formatHMS(total_ms), width - 250, y + 16);
-
-    y += rowH;
-  }
-
-  return canvas.toBuffer('image/png');
-}
-
-// ---------- Interactions ----------
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
-  if (interaction.commandName === 'leaderboard') {
-    const limit = interaction.options.getInteger('limit') ?? 10;
-    await interaction.deferReply(); // give time to render
-    try {
-      const guild = await client.guilds.fetch(GUILD_ID);
-      const png = await renderLeaderboard(guild, limit);
-      const file = new AttachmentBuilder(png, { name: 'leaderboard.png' });
-      await interaction.editReply({ files: [file] });
-    } catch (err) {
-      console.error('Leaderboard error:', err);
-      await interaction.editReply('Sorry, I failed to render the leaderboard.');
-    }
-  }
-});
-
 // ---------- Voice tracking + bot pinning ----------
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   const user = (newState.member ?? oldState.member);
@@ -387,7 +253,6 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 // ---------- Lifecycle ----------
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Logged in as ${c.user.tag}`);
-  await registerCommands();
   await seedCurrentSessions();
   connectToVC();
 });
