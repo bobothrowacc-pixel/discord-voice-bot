@@ -5,6 +5,7 @@ console.log('Transport env:', process.env.DISCORDJS_VOICE_TRANSPORT);
 
 require('dotenv').config();
 
+// --- Tiny web server (optional; useful for health checks) ---
 const express = require('express');
 const app = express();
 app.get('/', (_req, res) => res.status(200).send('OK'));
@@ -12,7 +13,10 @@ app.get('/health', (_req, res) => res.status(200).json({ ok: true, ts: Date.now(
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`[WEB] Listening on :${port}`));
 
-const { Client, GatewayIntentBits, Events, REST, Routes, AttachmentBuilder } = require('discord.js');
+// --- Discord / Voice ---
+const {
+  Client, GatewayIntentBits, Events, REST, Routes, AttachmentBuilder
+} = require('discord.js');
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -28,10 +32,10 @@ console.log('[Voice Deps]\n' + generateDependencyReport());
 // ---------- Config ----------
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
-const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID; // target VC for your bot to sit in
-const DB_PATH = process.env.DB_PATH || './data.db';     // use a persistent disk in production
+const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID; // VC to pin bot in
+const DB_PATH = process.env.DB_PATH || './data.db';     // use persistent disk in prod
 
-// ---------- DB (SQLite, sync & fast) ----------
+// ---------- DB (SQLite via better-sqlite3) ----------
 const Database = require('better-sqlite3');
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
@@ -78,101 +82,126 @@ function endSession(userId, when = Date.now()) {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates, // needed to track join/leave
+    GatewayIntentBits.GuildVoiceStates, // needed to track voice joins/leaves
   ],
 });
 
-// ---------- Minimal “silent stream” player ----------
+// ---------- Silent player (keeps voice alive) ----------
 const { PassThrough } = require('stream');
 function makeSilenceStream() {
   const pt = new PassThrough();
-  const frame = Buffer.from([0xF8, 0xFF, 0xFE]); // Opus SILK comfort-noise frame
-  const interval = setInterval(() => pt.write(frame), 20); // 50fps
+  const frame = Buffer.from([0xF8, 0xFF, 0xFE]); // Opus "silence" frame
+  const interval = setInterval(() => pt.write(frame), 20); // 50 fps
   pt.on('close', () => clearInterval(interval));
   return pt;
 }
+
 let connection = null;
 let player = null;
+let connectLock = false;       // prevents overlapping joins
+let reconnectTimer = null;     // debounced reconnect timer
 
-// ---------- Connect bot to your VC and keep it there ----------
 async function connectToVC() {
-  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
-  if (!guild) return console.error('[VC] Guild not found. Check GUILD_ID.');
-  const channel = await guild.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
-  if (!channel || channel.type !== 2) return console.error('[VC] VOICE_CHANNEL_ID invalid.');
-
-  console.log('[VC] Joining voice channel...');
-  connection = joinVoiceChannel({
-    channelId: VOICE_CHANNEL_ID,
-    guildId: GUILD_ID,
-    adapterCreator: guild.voiceAdapterCreator,
-    selfDeaf: true,
-    selfMute: false,
-  });
-
-  player = createAudioPlayer();
-  const resource = createAudioResource(makeSilenceStream(), { inputType: StreamType.Opus });
-  player.play(resource);
-  connection.subscribe(player);
+  if (connectLock) {
+    console.log('[VC] connectToVC: already running, skipping.');
+    return;
+  }
+  connectLock = true;
 
   try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-    console.log('🔊 Connected and streaming silence.');
-  } catch (err) {
-    console.error('[VC] Failed to become Ready:', err);
-    try { connection.destroy(); } catch {}
-    connection = null;
-  }
-
-  connection?.on('stateChange', async (o, n) => {
-    console.log(`[VC] State: ${o.status} -> ${n.status}`);
-    if (n.status === VoiceConnectionStatus.Disconnected) {
-      try {
-        await Promise.race([
-          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-        ]);
-        console.log('[VC] Quick reconnect OK');
-      } catch {
-        console.warn('[VC] Rebuilding connection...');
-        try { connection.destroy(); } catch {}
-        connection = null;
-        setTimeout(connectToVC, 5_000);
-      }
-    } else if (n.status === VoiceConnectionStatus.Destroyed) {
-      console.warn('[VC] Destroyed. Rejoining...');
-      setTimeout(connectToVC, 5_000);
+    const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+    if (!guild) {
+      console.error('[VC] Guild not found. Check GUILD_ID.');
+      return;
     }
-  });
 
-  player.on('error', (err) => console.error('[Player] Error:', err));
+    const channel = await guild.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
+    if (!channel || channel.type !== 2) {
+      console.error('[VC] VOICE_CHANNEL_ID invalid or not a voice channel.');
+      return;
+    }
+
+    if (connection && connection.state?.status !== 'destroyed') {
+      console.log('[VC] Already connected/connecting, status:', connection.state.status);
+      return;
+    }
+
+    console.log('[VC] Joining voice channel...');
+    connection = joinVoiceChannel({
+      channelId: VOICE_CHANNEL_ID,
+      guildId: GUILD_ID,
+      adapterCreator: guild.voiceAdapterCreator,
+      selfDeaf: true,
+      selfMute: false,
+    });
+
+    // fresh player each time
+    player = createAudioPlayer();
+    const resource = createAudioResource(makeSilenceStream(), { inputType: StreamType.Opus });
+    player.play(resource);
+    connection.subscribe(player);
+
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+      console.log('🔊 Connected and streaming silence.');
+    } catch (err) {
+      console.error('[VC] Failed to become Ready:', err);
+      try { connection.destroy(); } catch {}
+      connection = null;
+      return; // IMPORTANT: bail before attaching listeners
+    }
+
+    if (!connection) return; // safety
+
+    // Ensure no duplicate listeners
+    connection.removeAllListeners?.('stateChange');
+
+    connection.on('stateChange', async (oldState, newState) => {
+      console.log(`[VC] State: ${oldState.status} -> ${newState.status}`);
+
+      if (newState.status === VoiceConnectionStatus.Disconnected) {
+        try {
+          await Promise.race([
+            entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+            entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+          ]);
+          console.log('[VC] Quick reconnect OK');
+        } catch {
+          console.warn('[VC] Quick reconnect failed. Rebuilding...');
+          try { connection.destroy(); } catch {}
+          connection = null;
+
+          clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(connectToVC, 5_000);
+        }
+      } else if (newState.status === VoiceConnectionStatus.Destroyed) {
+        console.warn('[VC] Destroyed. Rejoining soon...');
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connectToVC, 5_000);
+      } else if (
+        newState.status === VoiceConnectionStatus.Connecting ||
+        newState.status === VoiceConnectionStatus.Signalling
+      ) {
+        try {
+          await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+          console.log('✅ Transitioned to Ready.');
+        } catch {
+          console.warn('[VC] Stuck during transition. Rebuilding...');
+          try { connection.destroy(); } catch {}
+          connection = null;
+          clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(connectToVC, 5_000);
+        }
+      }
+    });
+
+    player.on('error', (err) => console.error('[Player] Error:', err));
+  } finally {
+    connectLock = false;
+  }
 }
 
-// ---------- Track voice time ----------
-client.on(Events.VoiceStateUpdate, (oldState, newState) => {
-  const userId = (newState.member ?? oldState.member)?.id;
-  if (!userId || userId === client.user?.id) return;
-
-  const wasIn = !!oldState.channelId;
-  const nowIn = !!newState.channelId;
-
-  if (!wasIn && nowIn) {
-    // joined any VC → start
-    startSession(userId, Date.now());
-  } else if (wasIn && !nowIn) {
-    // left VC → end & add
-    const delta = endSession(userId, Date.now());
-    if (delta > 0) console.log(`[TIME] +${(delta/1000/60).toFixed(1)}m to ${userId}`);
-  } else if (wasIn && nowIn && oldState.channelId !== newState.channelId) {
-    // moved channel → close old session, start new one (keeps continuity)
-    const when = Date.now();
-    const delta = endSession(userId, when);
-    startSession(userId, when);
-    if (delta > 0) console.log(`[TIME] move: +${(delta/1000/60).toFixed(1)}m to ${userId}`);
-  }
-});
-
-// On startup, for anyone already in VC, start sessions “from now” (we can’t know their earlier join times)
+// ---------- Seed sessions for current VC occupants on startup ----------
 async function seedCurrentSessions() {
   const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
   if (!guild) return;
@@ -189,7 +218,7 @@ async function seedCurrentSessions() {
   console.log('[TIME] Seeded sessions for current VC members.');
 }
 
-// ---------- Slash commands registration ----------
+// ---------- Slash commands ----------
 const commands = [
   {
     name: 'leaderboard',
@@ -207,9 +236,8 @@ const commands = [
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
-  await rest.put(Routes.applicationGuildCommands((await client.application.fetch()).id, GUILD_ID), {
-    body: commands
-  });
+  const app = await client.application.fetch();
+  await rest.put(Routes.applicationGuildCommands(app.id, GUILD_ID), { body: commands });
   console.log('✅ Registered slash commands.');
 }
 
@@ -235,7 +263,7 @@ async function renderLeaderboard(guild, limit = 10) {
   const ctx = canvas.getContext('2d');
 
   // background
-  ctx.fillStyle = '#0f172a'; // slate-900
+  ctx.fillStyle = '#0f172a';
   ctx.fillRect(0, 0, width, height);
 
   // header
@@ -271,7 +299,6 @@ async function renderLeaderboard(guild, limit = 10) {
       try {
         const img = await loadImage(avatarUrl);
         const ax = 70, ay = y - 6, size = 64;
-        // circle clip
         ctx.save();
         ctx.beginPath();
         ctx.arc(ax + size / 2, ay + size / 2, size / 2, 0, Math.PI * 2);
@@ -279,7 +306,7 @@ async function renderLeaderboard(guild, limit = 10) {
         ctx.clip();
         ctx.drawImage(img, ax, ay, size, size);
         ctx.restore();
-      } catch { /* ignore */ }
+      } catch {}
     }
 
     // username & hours
@@ -287,7 +314,7 @@ async function renderLeaderboard(guild, limit = 10) {
     try {
       const member = await guild.members.fetch(user_id);
       displayName = member.displayName || member.user.username;
-    } catch { /* ignore */ }
+    } catch {}
 
     ctx.fillStyle = '#e5e7eb';
     ctx.font = 'bold 22px sans-serif';
@@ -322,26 +349,47 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
+// ---------- Voice tracking + bot pinning ----------
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  const user = (newState.member ?? oldState.member);
+  const userId = user?.id;
+  const botId = client.user?.id;
+
+  if (!userId) return;
+
+  // Track everyone except the bot
+  if (userId !== botId) {
+    const wasIn = !!oldState.channelId;
+    const nowIn = !!newState.channelId;
+
+    if (!wasIn && nowIn) {
+      startSession(userId, Date.now());
+    } else if (wasIn && !nowIn) {
+      const delta = endSession(userId, Date.now());
+      if (delta > 0) console.log(`[TIME] +${(delta / 1000 / 60).toFixed(1)}m to ${userId}`);
+    } else if (wasIn && nowIn && oldState.channelId !== newState.channelId) {
+      const when = Date.now();
+      const delta = endSession(userId, when);
+      startSession(userId, when);
+      if (delta > 0) console.log(`[TIME] move: +${(delta / 1000 / 60).toFixed(1)}m to ${userId}`);
+    }
+  } else {
+    // If the BOT itself gets moved/removed from the target VC, debounce rejoin
+    const nowInTarget = newState.channelId === VOICE_CHANNEL_ID;
+    if (!nowInTarget) {
+      console.log('⚠️ Bot left/moved from target VC. Rejoining...');
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connectToVC, 3000);
+    }
+  }
+});
+
 // ---------- Lifecycle ----------
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Logged in as ${c.user.tag}`);
   await registerCommands();
   await seedCurrentSessions();
   connectToVC();
-});
-
-client.on(Events.VoiceStateUpdate, (oldState, newState) => {
-  // Keep the bot pinned in the target VC, if moved
-  const botId = client.user?.id;
-  if (!botId) return;
-  const wasBot = oldState.member?.id === botId || newState.member?.id === botId;
-  if (wasBot) {
-    const nowInTarget = newState.channelId === VOICE_CHANNEL_ID;
-    if (!nowInTarget) {
-      console.log('⚠️ Bot moved; rejoining target VC...');
-      setTimeout(connectToVC, 3_000);
-    }
-  }
 });
 
 process.on('unhandledRejection', (err) => console.error('UnhandledRejection:', err));
